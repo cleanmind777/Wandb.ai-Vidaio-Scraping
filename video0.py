@@ -19,7 +19,7 @@ from datetime import datetime
 # 5. Set these variables:
 GOOGLE_SHEETS_CREDENTIALS_FILE = 'credentials.json'  # Path to your service account JSON file
 GOOGLE_SHEET_NAME = 'Log Data'  # Name of your Google Sheet
-GOOGLE_WORKSHEET_NAME = 'Sheet1'  # Name of the worksheet/tab
+GOOGLE_WORKSHEET_NAME = 'Vali0'  # Name of the worksheet/tab
 
 def init_google_sheets():
     """Initialize Google Sheets connection"""
@@ -86,24 +86,116 @@ def init_google_sheets():
         print("3. Check that GOOGLE_SHEET_NAME and GOOGLE_WORKSHEET_NAME are correct")
         return None
 
-def get_existing_line_numbers(sheet):
-    """Get all existing line numbers from Google Sheets to avoid duplicates"""
+def get_last_timestamp_from_sheet(sheet):
+    """Get the timestamp from the last row in Google Sheets"""
     try:
         # Get all values from the sheet
         all_values = sheet.get_all_values()
-        if len(all_values) <= 1:  # Only header row
-            return set()
+        if len(all_values) <= 1:  # Only header row or empty
+            return None
         
-        # Assuming line_number is in the first column (index 0)
-        # Skip header row (index 0)
-        existing_line_numbers = set()
-        for row in all_values[1:]:  # Skip header
-            if row and row[0]:  # If line_number column has a value
-                existing_line_numbers.add(row[0].strip())
-        return existing_line_numbers
+        # Timestamp is in column index 1 (2nd column)
+        # Get the last row (excluding header)
+        last_row = all_values[-1]
+        if len(last_row) > 1 and last_row[1]:  # If timestamp column has a value
+            return last_row[1].strip()
+        return None
     except Exception as e:
-        print(f"Error reading existing data: {e}")
-        return set()
+        print(f"Error reading last timestamp: {e}")
+        return None
+
+def compare_timestamps(timestamp1, timestamp2):
+    """Compare two timestamps. Returns True if timestamp1 > timestamp2 (timestamp1 is newer)"""
+    if not timestamp1 or not timestamp2:
+        return True  # If either is missing, allow upload
+    
+    try:
+        # Parse timestamps in format: YYYY-MM-DD HH:MM:SS.mmm
+        from datetime import datetime
+        # Remove milliseconds for comparison if present
+        ts1_clean = timestamp1.split('.')[0] if '.' in timestamp1 else timestamp1
+        ts2_clean = timestamp2.split('.')[0] if '.' in timestamp2 else timestamp2
+        
+        dt1 = datetime.strptime(ts1_clean, '%Y-%m-%d %H:%M:%S')
+        dt2 = datetime.strptime(ts2_clean, '%Y-%m-%d %H:%M:%S')
+        
+        return dt1 >= dt2
+    except Exception as e:
+        print(f"Error comparing timestamps: {e}")
+        # If parsing fails, allow upload to be safe
+        return True
+
+def should_skip_message(message):
+    """Check if message should be skipped based on content"""
+    if not message:
+        return False
+    
+    skip_patterns = [
+        "Compression data successfully sent to dashboard",
+        "Updating miner manager with 5 compression miner scores after synthetic requests processing",
+        "Synthetic compression scoring results for 5 miners",
+        "Uids:"
+    ]
+    
+    for pattern in skip_patterns:
+        if pattern in message:
+            return True
+    return False
+
+def upload_single_result_to_google_sheets(sheet, result, last_timestamp=None):
+    """Upload a single result to Google Sheets immediately, checking if timestamp is newer than last row"""
+    if sheet is None:
+        return False
+    
+    if result is None:
+        return False
+    
+    try:
+        line_number = str(result['line_number'])
+        current_timestamp = str(result['timestamp']) if result['timestamp'] else ''
+        full_text = str(result['full_text']) if result['full_text'] else ''
+        message = str(result.get('message', ''))
+        
+        # Check if message should be skipped
+        if should_skip_message(message):
+            print(f"  ⏭ Skipping line {line_number} - message type not needed: {message[:60]}...")
+            return False
+        
+        # Get last timestamp from sheet if not provided
+        if last_timestamp is None:
+            last_timestamp = get_last_timestamp_from_sheet(sheet)
+        
+        # Check if current timestamp is newer than last timestamp
+        if last_timestamp:
+            if not compare_timestamps(current_timestamp, last_timestamp):
+                print(f"  ⏭ Skipping line {line_number} - timestamp {current_timestamp} is not newer than last row ({last_timestamp})")
+                return False
+        
+        # Prepare row data
+        row = [
+            line_number,
+            current_timestamp,
+            str(result['compression_id']) if result['compression_id'] else '',
+            str(result['message']) if result['message'] else '',
+            full_text,
+            datetime.now().strftime('%Y-%m-%d %H:%M:%S')  # Upload timestamp
+        ]
+        
+        # Check if sheet is empty and add header
+        all_values = sheet.get_all_values()
+        if len(all_values) == 0:
+            header = ['Line Number', 'Timestamp', 'Compression ID', 'Message', 'Full Text', 'Uploaded At']
+            sheet.append_row(header)
+        
+        # Upload the single row
+        sheet.append_row(row)
+        
+        print(f"  ✓ Uploaded line {line_number} (timestamp: {current_timestamp}) to Google Sheets")
+        return True
+        
+    except Exception as e:
+        print(f"  ❌ Error uploading line {result.get('line_number', 'unknown')} to Google Sheets: {e}")
+        return False
 
 def upload_to_google_sheets(sheet, new_results):
     """Upload new results to Google Sheets"""
@@ -119,13 +211,25 @@ def upload_to_google_sheets(sheet, new_results):
         print(f"\n--- Google Sheets Upload Process ---")
         print(f"Total results to check: {len(new_results)}")
         
-        # Get existing line numbers
-        print("Reading existing data from Google Sheets...")
-        existing_line_numbers = get_existing_line_numbers(sheet)
-        print(f"Found {len(existing_line_numbers)} existing entries in Google Sheets")
+        # Get last timestamp from Google Sheets
+        print("Reading last timestamp from Google Sheets...")
+        last_timestamp = get_last_timestamp_from_sheet(sheet)
+        if last_timestamp:
+            print(f"Last timestamp in sheet: {last_timestamp}")
+        else:
+            print("Sheet is empty or has no timestamp. Will upload all results.")
         
-        # Filter out duplicates
-        to_upload = [r for r in new_results if r['line_number'] not in existing_line_numbers]
+        # Filter results - only upload if timestamp is newer than last row and message is not skipped
+        to_upload = []
+        for r in new_results:
+            message = str(r.get('message', ''))
+            # Skip unwanted message types
+            if should_skip_message(message):
+                continue
+            
+            current_ts = str(r.get('timestamp', '')).strip()
+            if not last_timestamp or compare_timestamps(current_ts, last_timestamp):
+                to_upload.append(r)
         
         if not to_upload:
             print("All data already exists in Google Sheets. No new entries to upload.")
@@ -177,11 +281,21 @@ def upload_to_google_sheets(sheet, new_results):
         print("2. Verify the Google Sheet is shared with the service account email")
         print("3. Check that GOOGLE_SHEET_NAME and GOOGLE_WORKSHEET_NAME are correct")
 
-def scrape_data(driver, wait):
-    """Scrape data from the webpage"""
+def scrape_data(driver, wait, sheet=None):
+    """Scrape data from the webpage and upload to Google Sheets immediately"""
     print("\n" + "="*60)
     print(f"Starting data scrape at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*60)
+    
+    # Get last timestamp from Google Sheets for comparison
+    last_timestamp = None
+    if sheet:
+        print("Loading last timestamp from Google Sheets...")
+        last_timestamp = get_last_timestamp_from_sheet(sheet)
+        if last_timestamp:
+            print(f"Last timestamp in sheet: {last_timestamp}")
+        else:
+            print("Sheet is empty or has no timestamp. Will upload all new entries.")
     
     # Refresh the page
     print("Refreshing page...")
@@ -210,6 +324,7 @@ def scrape_data(driver, wait):
     results = []
     processed_line_numbers = set()
     match_count = 0
+    upload_count = 0
     
     # Loop through all matches by clicking next button
     while True:
@@ -275,6 +390,23 @@ def scrape_data(driver, wait):
                     }
                     results.append(result)
                     print(f"✓ Extracted line {line_number}: {message[:50] if message else 'N/A'}...")
+                    
+                    # Check if message should be skipped before uploading
+                    if should_skip_message(message):
+                        print(f"  ⏭ Skipping line {line_number} - message type not needed: {message[:60]}...")
+                    # Upload to Google Sheets immediately (before clicking next)
+                    elif sheet:
+                        # Check if timestamp is newer than last row
+                        current_ts = str(result.get('timestamp', '')).strip()
+                        if not last_timestamp or compare_timestamps(current_ts, last_timestamp):
+                            uploaded = upload_single_result_to_google_sheets(sheet, result, last_timestamp)
+                            if uploaded:
+                                upload_count += 1
+                                # Update last_timestamp after successful upload
+                                last_timestamp = current_ts
+                                print(f"  Updated last timestamp to: {last_timestamp}")
+                        else:
+                            print(f"  ⏭ Skipping line {line_number} - timestamp {current_ts} is not newer than last row ({last_timestamp})")
             
             except Exception as e:
                 print(f"Error finding current element: {e}")
@@ -328,6 +460,8 @@ def scrape_data(driver, wait):
             break
     
     print(f"\nScraping complete! Found {len(results)} matching elements.")
+    if sheet:
+        print(f"Uploaded {upload_count} new entries to Google Sheets during scraping.")
     return results
 
 def list_available_sheets():
@@ -423,7 +557,7 @@ def main():
     # Initialize Selenium
     driver = webdriver.Chrome()
     driver.maximize_window()
-    driver.get("https://wandb.ai/vidaio_vidaio/sn85-validators/runs/29d9gwh6/logs?nw=nwuseraayad")
+    driver.get("https://wandb.ai/vidaio_vidaio/sn85-validators/runs/amd00p3w/logs")
     wait = WebDriverWait(driver, 10)
     
     # Wait for initial page load
@@ -437,8 +571,8 @@ def main():
             print(f"ITERATION #{iteration}")
             print(f"{'='*60}")
             
-            # Scrape data
-            results = scrape_data(driver, wait)
+            # Scrape data (uploads to Google Sheets immediately as it finds each element)
+            results = scrape_data(driver, wait, sheet)
             
             if results:
                 # Save to local JSON file
@@ -446,15 +580,14 @@ def main():
                     json.dump(results, f, indent=2, ensure_ascii=False)
                 print(f"Saved {len(results)} entries to info_logs.json")
                 
-                # Upload to Google Sheets (only new entries)
-                if sheet:
-                    upload_to_google_sheets(sheet, results)
+                # Note: Data is already uploaded to Google Sheets during scraping
+                # The upload_to_google_sheets function is kept for batch uploads if needed
             
             # Wait 5 minutes before next iteration
-            print(f"\nWaiting 5 minutes before next refresh...")
-            next_time = datetime.fromtimestamp(datetime.now().timestamp() + 300)
+            print(f"\nWaiting 30 seconds before next refresh...")
+            next_time = datetime.fromtimestamp(datetime.now().timestamp() + 30)
             print(f"Next scrape will start at {next_time.strftime('%Y-%m-%d %H:%M:%S')}")
-            time.sleep(300)  # 5 minutes = 300 seconds
+            time.sleep(30)  # 5 minutes = 300 seconds
             
         except KeyboardInterrupt:
             print("\nStopped by user.")
